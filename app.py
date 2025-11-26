@@ -1,23 +1,17 @@
+# app.py
 """
-app.py
-
 Predictive Risk Modeling Framework for Microplastic Pollution (Streamlit UI, auto-run)
 
-Changes in this version:
-- When a user uploads a CSV in the Streamlit UI the full pipeline runs automatically (no "Run" button).
-- A clear sidebar navigation is provided so users can switch between:
-    * Upload & Preview
-    * Visualizations
-    * Model Results
-    * Download Outputs
-- Robust CSV preview reading (multiple encodings + fallback) to avoid decode errors.
-- All outputs (plots, summaries) continue to be saved to the ./outputs/ folder.
-
-Usage:
-    streamlit run app.py
-
-Requirements:
-    pandas, numpy, scikit-learn, matplotlib, seaborn, streamlit
+This corrected version:
+- Robust CSV reading & preview
+- Outlier handling (IQR capping)
+- Skewness detection + log1p shifts
+- Categorical handling (smart one-hot / label encode for high-cardinality)
+- Ensures final X is numeric (no stray object columns) before scaling and modelling
+- Feature ranking using RandomForest and SelectFromModel
+- Trains LogisticRegression, RandomForest, GradientBoosting
+- Evaluates on test set and performs Stratified K-Fold cross-validation
+- Saves plots & CSV outputs to ./outputs/
 """
 
 import os
@@ -40,6 +34,7 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.feature_selection import SelectFromModel
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -62,11 +57,9 @@ sns.set(style="whitegrid")
 # Try Streamlit import
 try:
     import streamlit as st  # type: ignore
-
     STREAMLIT_AVAILABLE = True
 except Exception:
     STREAMLIT_AVAILABLE = False
-    # If Streamlit is not available, we fallback to CLI behavior below.
 
 
 # ----------------------------
@@ -125,9 +118,9 @@ def plot_boxplot_before_after(before: pd.DataFrame, after: pd.DataFrame, cols: L
         if col not in before.columns or col not in after.columns:
             continue
         fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        sns.boxplot(x=before[col], ax=axes[0], color="skyblue")
+        sns.boxplot(x=before[col], ax=axes[0])
         axes[0].set_title(f"{col} (Before)")
-        sns.boxplot(x=after[col], ax=axes[1], color="lightgreen")
+        sns.boxplot(x=after[col], ax=axes[1])
         axes[1].set_title(f"{col} (After - capped)")
         fig.suptitle(f"Outlier handling (IQR cap) for {col}")
         saved.append(save_and_show(fig, f"{prefix}_boxplot_{col}.png"))
@@ -140,9 +133,9 @@ def plot_histogram_comparison(df_before: pd.DataFrame, df_after: pd.DataFrame, c
         if col not in df_before.columns or col not in df_after.columns:
             continue
         fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-        sns.histplot(df_before[col].dropna(), kde=True, ax=axes[0], color="cornflowerblue")
+        sns.histplot(df_before[col].dropna(), kde=True, ax=axes[0])
         axes[0].set_title(f"{col} BEFORE transformation\nskew={df_before[col].skew():.3f}")
-        sns.histplot(df_after[col].dropna(), kde=True, ax=axes[1], color="seagreen")
+        sns.histplot(df_after[col].dropna(), kde=True, ax=axes[1])
         axes[1].set_title(f"{col} AFTER transformation\nskew={df_after[col].skew():.3f}")
         fig.suptitle(f"Skewness correction for {col}")
         saved.append(save_and_show(fig, f"{prefix}_hist_{col}.png"))
@@ -156,7 +149,7 @@ def plot_categorical_counts(df: pd.DataFrame, cols: List[str], top_n: int = 10, 
             continue
         vc = df[col].astype(str).value_counts().nlargest(top_n)
         fig, ax = plt.subplots(figsize=(8, 4))
-        sns.barplot(x=vc.values, y=vc.index, palette="viridis", ax=ax)
+        sns.barplot(x=vc.values, y=vc.index, ax=ax)
         ax.set_xlabel("Count")
         ax.set_ylabel(col)
         ax.set_title(f"Top {len(vc)} value counts for {col}")
@@ -175,7 +168,7 @@ def plot_scaled_feature_distributions(X_scaled: pd.DataFrame, prefix: str = "sca
     if n == 1:
         axes = [axes]
     for ax, col in zip(axes, sample_cols):
-        sns.histplot(X_scaled[col], kde=True, ax=ax, color="orchid")
+        sns.histplot(X_scaled[col], kde=True, ax=ax)
         ax.set_title(f"Scaled Distribution: {col}")
     fig.suptitle("Scaled numerical feature distributions (sample)")
     saved.append(save_and_show(fig, f"{prefix}_feature_dists_sample.png"))
@@ -200,7 +193,7 @@ def plot_feature_importances(model, feature_names: List[str], name: str, top_n: 
 
     fi = pd.Series(importances, index=feature_names).sort_values(ascending=False).head(top_n)
     fig, ax = plt.subplots(figsize=(8, max(4, top_n * 0.4)))
-    sns.barplot(x=fi.values, y=fi.index, ax=ax, palette="magma")
+    sns.barplot(x=fi.values, y=fi.index, ax=ax)
     ax.set_title(title)
     ax.set_xlabel("Importance / |Coefficient|")
     return save_and_show(fig, f"feature_importances_{name}.png")
@@ -222,7 +215,7 @@ def plot_confusion_matrix_heatmap(y_true, y_pred, classes: List[str], name: str)
 def plot_metrics_comparison(metrics_dict: Dict[str, Dict[str, float]], prefix: str = "metrics"):
     df = pd.DataFrame(metrics_dict).T  # models x metrics
     metrics = ["accuracy", "precision", "recall", "f1"]
-    df = df[metrics]
+    df = df.reindex(columns=[m for m in metrics if m in df.columns])
     fig, ax = plt.subplots(figsize=(8, 5))
     df.plot(kind="bar", ax=ax)
     ax.set_ylim(0, 1)
@@ -244,6 +237,36 @@ def plot_cv_boxplot(cv_scores: Dict[str, np.ndarray], prefix: str = "cv"):
     ax.set_title("Cross-validation accuracy distribution")
     ax.set_ylabel("Accuracy")
     return save_and_show(fig, f"{prefix}_boxplot.png")
+
+
+# ----------------------------
+# Feature ranking / selection
+# ----------------------------
+def rank_and_select_features(X: pd.DataFrame, y: pd.Series, top_n: int = 20) -> Tuple[List[str], Dict]:
+    """
+    Use RandomForest to rank features, then SelectFromModel to pick important ones.
+    Returns selected feature list and meta info.
+    """
+    meta = {}
+    if X.shape[0] < 2 or y.nunique() < 2:
+        # not enough data to rank
+        return X.columns.tolist(), meta
+
+    rf = RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1)
+    rf.fit(X, y)
+    importances = pd.Series(rf.feature_importances_, index=X.columns).sort_values(ascending=False)
+    top_features = importances.head(min(top_n, len(importances))).index.tolist()
+    # Use SelectFromModel with threshold mean importance
+    selector = SelectFromModel(rf, threshold="mean", prefit=True)
+    selected_mask = selector.get_support()
+    selected = list(X.columns[selected_mask])
+    if not selected:
+        # fallback to top k
+        selected = top_features[: min(10, len(top_features))]
+    meta["feature_importances"] = importances.to_dict()
+    meta["top_features"] = top_features
+    meta["selected_features"] = selected
+    return selected, meta
 
 
 # ----------------------------
@@ -279,7 +302,7 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
     for c in cat_cols_all:
         df[c] = df[c].fillna("Missing")
 
-    # Outlier handling (IQR) for specified columns
+    # Outlier handling (IQR) for some expected columns if present
     outlier_cols = [
         "MP_Count_per_L",
         "Risk_Score",
@@ -301,7 +324,7 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
     except Exception:
         pass
 
-    # Skewness detection & log1p transform
+    # Skewness detection & log1p transform on numeric columns (but not target)
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     if target_col in numeric_cols:
         numeric_cols.remove(target_col)
@@ -314,6 +337,7 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
         shift = 0.0
         if col_min <= -1e-9:
             shift = abs(col_min) + 1e-6
+        # avoid taking log of zero/negatives
         df[col] = np.log1p(df[col] + shift)
         transforms_applied[col] = {"shift": shift}
     try:
@@ -321,7 +345,7 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
     except Exception:
         pass
 
-    # Categorical encoding (user-specified list)
+    # Categorical encoding for known columns (if present)
     cols_to_encode = [
         "Location",
         "Shape",
@@ -343,6 +367,8 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
     df_encoded = df.copy()
     label_encoders = {}
     onehot_columns = []
+
+    # Encode the specified categorical columns using either get_dummies (low cardinality) or LabelEncoder (high)
     for col in cols_to_encode_present:
         df_encoded[col] = df_encoded[col].astype(str).fillna("Missing")
         nunique = df_encoded[col].nunique()
@@ -356,11 +382,29 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
             label_encoders[col] = le
             df_encoded = df_encoded.drop(columns=[col])
 
-    # Prepare target
-    if target_col in df_encoded.columns:
-        y_raw = df_encoded[target_col]
-    else:
+    # After user-specified encoding, ensure ALL remaining object columns are encoded so X is numeric
+    remaining_obj_cols = df_encoded.select_dtypes(include=["object", "category"]).columns.tolist()
+    for col in remaining_obj_cols:
+        df_encoded[col] = df_encoded[col].astype(str).fillna("Missing")
+        nunique = df_encoded[col].nunique()
+        # If small cardinality, one-hot; otherwise label-encode
+        if nunique <= 12 and df_encoded.shape[0] >= nunique:
+            dummies = pd.get_dummies(df_encoded[col], prefix=col, drop_first=True)
+            df_encoded = pd.concat([df_encoded.drop(columns=[col]), dummies], axis=1)
+            onehot_columns.extend(list(dummies.columns))
+        else:
+            le = LabelEncoder()
+            df_encoded[col + "_LE"] = le.fit_transform(df_encoded[col])
+            label_encoders[col] = le
+            df_encoded = df_encoded.drop(columns=[col])
+
+    # Prepare target (y)
+    if target_col in df.columns:
         y_raw = df[target_col]
+    else:
+        # fallback if target not found in original (rare)
+        raise RuntimeError(f"Target column '{target_col}' not found in dataset.")
+
     if y_raw.dtype == "O" or not pd.api.types.is_numeric_dtype(y_raw):
         le_target = LabelEncoder()
         y = pd.Series(le_target.fit_transform(y_raw.astype(str)), name=target_col)
@@ -368,37 +412,51 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
     else:
         y = pd.Series(y_raw, name=target_col)
 
+    # Build X (drop original target if present in df_encoded)
     if target_col in df_encoded.columns:
         X_df = df_encoded.drop(columns=[target_col])
     else:
         X_df = df_encoded.copy()
 
+    # Ensure all columns of X_df are numeric (they should be after encoding)
+    non_numeric = X_df.select_dtypes(exclude=[np.number]).columns.tolist()
+    if non_numeric:
+        # last resort: try to coerce to numeric
+        for c in non_numeric:
+            X_df[c] = pd.to_numeric(X_df[c], errors="coerce").fillna(0.0)
+
+    # Feature scaling (fit on numeric features)
     numeric_features = X_df.select_dtypes(include=[np.number]).columns.tolist()
-    scaler = StandardScaler()
+    scaler = StandardScaler() if numeric_features else None
     if numeric_features:
-        X_numeric_scaled = pd.DataFrame(scaler.fit_transform(X_df[numeric_features]), columns=numeric_features, index=X_df.index)
+        X_scaled = pd.DataFrame(scaler.fit_transform(X_df[numeric_features]), columns=numeric_features, index=X_df.index)
     else:
-        X_numeric_scaled = pd.DataFrame(index=X_df.index)
+        X_scaled = pd.DataFrame(index=X_df.index)
+
+    X_final = X_scaled  # X_scaled contains all features (we coerced non-numeric earlier)
+    # If there are columns that were non-numeric but coerced into numeric with different names, they are in X_final already.
 
     try:
-        visuals["plots"].extend(plot_scaled_feature_distributions(X_numeric_scaled, prefix="scaled"))
+        visuals["plots"].extend(plot_scaled_feature_distributions(X_final, prefix="scaled"))
     except Exception:
         pass
 
-    non_numeric = X_df.select_dtypes(exclude=[np.number]).columns.tolist()
-    if non_numeric:
-        X_final = pd.concat([X_numeric_scaled, X_df[non_numeric].reset_index(drop=True)], axis=1)
+    # Feature ranking & selection
+    selected_features, fs_meta = rank_and_select_features(X_final, y, top_n=30)
+    # Keep only selected features for modeling (makes model leaner). If selection returns empty, keep all.
+    if selected_features:
+        X_model = X_final[selected_features]
     else:
-        X_final = X_numeric_scaled
+        X_model = X_final.copy()
 
     # Train-test split
     try:
         X_train, X_test, y_train, y_test = train_test_split(
-            X_final, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+            X_model, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
         )
     except Exception:
         X_train, X_test, y_train, y_test = train_test_split(
-            X_final, y, test_size=0.2, random_state=RANDOM_STATE, stratify=None
+            X_model, y, test_size=0.2, random_state=RANDOM_STATE, stratify=None
         )
 
     # Save a small snapshot of preprocessed data
@@ -416,6 +474,7 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
         "transforms_applied": transforms_applied,
         "visuals": visuals,
         "csv_path": csv_path,
+        "feature_selection": fs_meta,
     }
 
     return X_train, X_test, y_train, y_test, meta
@@ -423,17 +482,21 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
 
 def train_models(X_train: pd.DataFrame, y_train: pd.Series) -> Dict[str, object]:
     models = {
-        "LogisticRegression": LogisticRegression(max_iter=1000, random_state=RANDOM_STATE),
-        "RandomForest": RandomForestClassifier(n_estimators=100, random_state=RANDOM_STATE),
-        "GradientBoosting": GradientBoostingClassifier(n_estimators=100, random_state=RANDOM_STATE),
+        "LogisticRegression": LogisticRegression(max_iter=2000, random_state=RANDOM_STATE),
+        "RandomForest": RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1),
+        "GradientBoosting": GradientBoostingClassifier(n_estimators=200, random_state=RANDOM_STATE),
     }
 
     trained_models = {}
+    # If y has only one class, don't attempt to train classification models
+    if y_train.nunique() < 2:
+        raise RuntimeError("Target y contains only one class; cannot train classifiers.")
+
     for name, model in models.items():
         model.fit(X_train, y_train)
         trained_models[name] = model
         try:
-            plot_feature_importances(model, feature_names=X_train.columns.tolist(), name=name, top_n=12)
+            plot_feature_importances(model, feature_names=X_train.columns.tolist(), name=name, top_n=min(20, X_train.shape[1]))
         except Exception:
             pass
     return trained_models
@@ -446,10 +509,10 @@ def validate_models(trained_models: Dict[str, object], X_test: pd.DataFrame, y_t
 
     for name, model in trained_models.items():
         y_pred = model.predict(X_test)
-        acc = accuracy_score(y_test, y_pred)
-        prec = precision_score(y_test, y_pred, average="weighted", zero_division=0)
-        rec = recall_score(y_test, y_pred, average="weighted", zero_division=0)
-        f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
+        acc = float(accuracy_score(y_test, y_pred))
+        prec = float(precision_score(y_test, y_pred, average="weighted", zero_division=0))
+        rec = float(recall_score(y_test, y_pred, average="weighted", zero_division=0))
+        f1 = float(f1_score(y_test, y_pred, average="weighted", zero_division=0))
         results[name] = {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1}
         try:
             plot_confusion_matrix_heatmap(y_test, y_pred, classes=class_names, name=name)
@@ -470,10 +533,15 @@ def validate_models(trained_models: Dict[str, object], X_test: pd.DataFrame, y_t
 
 
 def cross_validate_models(trained_models: Dict[str, object], X: pd.DataFrame, y: pd.Series, k: int = 5) -> Dict[str, np.ndarray]:
+    # If y has only one class, cannot cross-validate stratified - return empty arrays
+    if y.nunique() < 2:
+        return {name: np.array([]) for name in trained_models.keys()}
+
     cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=RANDOM_STATE)
     cv_scores = {}
     for name, model in trained_models.items():
         try:
+            # cross_val_score will clone the estimator; safe to pass the fitted model
             scores = cross_val_score(model, X, y, cv=cv, scoring="accuracy", n_jobs=-1)
             cv_scores[name] = scores
         except Exception:
@@ -485,7 +553,7 @@ def cross_validate_models(trained_models: Dict[str, object], X: pd.DataFrame, y:
         pass
 
     try:
-        cv_summary = {k: (np.mean(v) if v.size else np.nan) for k, v in cv_scores.items()}
+        cv_summary = {k: (float(np.mean(v)) if v.size else np.nan) for k, v in cv_scores.items()}
         pd.Series(cv_summary).to_csv(os.path.join(OUTPUT_DIR, "cv_mean_accuracy_summary.csv"))
     except Exception:
         pass
@@ -604,6 +672,16 @@ def run_streamlit_app():
                     st.write(f"{model_name}: {scores}")
             else:
                 st.write("No cross-validation results.")
+
+            # Show FS summary if present
+            fs_meta = result.get("meta", {}).get("feature_selection", None)
+            if fs_meta:
+                st.subheader("Feature selection summary")
+                top = fs_meta.get("top_features", [])[:20]
+                st.write("Top features (by RandomForest importance):")
+                st.write(top)
+                st.write("Selected features used for modelling:")
+                st.write(fs_meta.get("selected_features", []))
 
             # Show list of saved CSV summaries
             summary_csv = os.path.join(OUTPUT_DIR, "test_results_summary.csv")
