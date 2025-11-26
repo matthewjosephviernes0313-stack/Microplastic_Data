@@ -273,14 +273,42 @@ def rank_and_select_features(X: pd.DataFrame, y: pd.Series, top_n: int = 20) -> 
 # Core processing (same pipeline)
 # ----------------------------
 def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, Dict]:
-    try:
-        df = pd.read_csv(csv_path)
-    except Exception as e:
-        raise RuntimeError(f"Failed to read CSV from '{csv_path}': {e}")
+    # Robust CSV loader (tries multiple encodings and a replacement fallback)
+    encodings_to_try = [None, "utf-8", "latin1", "cp1252"]
+    last_exception = None
+    df = None
+    used_encoding = None
+
+    for enc in encodings_to_try:
+        try:
+            if enc is None:
+                df = pd.read_csv(csv_path)
+                used_encoding = "default"
+            else:
+                df = pd.read_csv(csv_path, encoding=enc)
+                used_encoding = enc
+            # success
+            print(f"[load_and_preprocess_data] Loaded CSV using encoding: {used_encoding}")
+            break
+        except Exception as e:
+            last_exception = e
+            continue
+
+    # Final fallback: read with errors replaced
+    if df is None:
+        try:
+            with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            df = pd.read_csv(io.StringIO(text))
+            used_encoding = "fallback-replace-invalid-bytes"
+            print("[load_and_preprocess_data] Loaded CSV using fallback (invalid bytes replaced).")
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to read CSV from '{csv_path}' even after fallback.\n"
+                f"Last regular error: {last_exception}\nFinal fallback error: {e}"
+            )
 
     visuals = {"plots": []}
-
-    # Missing values heatmap
     try:
         visuals["plots"].append(plot_missing_values_heatmap(df, fname="missing_heatmap.png"))
     except Exception:
@@ -433,8 +461,7 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
     else:
         X_scaled = pd.DataFrame(index=X_df.index)
 
-    X_final = X_scaled  # X_scaled contains all features (we coerced non-numeric earlier)
-    # If there are columns that were non-numeric but coerced into numeric with different names, they are in X_final already.
+    X_final = X_scaled
 
     try:
         visuals["plots"].extend(plot_scaled_feature_distributions(X_final, prefix="scaled"))
@@ -475,6 +502,7 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
         "visuals": visuals,
         "csv_path": csv_path,
         "feature_selection": fs_meta,
+        "used_encoding": used_encoding,
     }
 
     return X_train, X_test, y_train, y_test, meta
