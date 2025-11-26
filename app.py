@@ -3,21 +3,19 @@ app.py
 
 Predictive Risk Modeling Framework for Microplastic Pollution (Streamlit-enabled)
 
+This version fixes CSV preview decoding errors by using robust CSV-reading fallback:
+- Tries pandas default read
+- If UnicodeDecodeError occurs, tries common encodings (utf-8, latin1, cp1252)
+- If still failing, opens file with errors='replace' into a StringIO and reads via pandas
+- Displays the encoding (or 'replaced-invalid-bytes') used for preview in the Streamlit UI
+
 Behavior:
 - If Streamlit is available (and you run `streamlit run app.py`) a browser UI will appear.
   * User uploads a CSV file via the UI.
   * The uploaded file is saved to ./inputs/ and then the pipeline runs end-to-end.
   * All plots and summaries are stored in ./outputs/ and displayed in the Streamlit UI.
 - If Streamlit is not available or you run the script directly (python app.py), the script falls back
-  to a CLI flow that prompts for a CSV path (as in v3).
-
-Key features:
-- Preprocessing: missing values, outlier capping (IQR), skewness detection & log1p transform,
-  categorical encoding (one-hot or label), feature scaling (StandardScaler), train-test split.
-- Models: Logistic Regression, Random Forest, Gradient Boosting (trained on same train set).
-- Validation: accuracy, precision, recall, F1, classification reports, confusion matrices.
-- Cross-validation: StratifiedKFold (k=5) and boxplot of CV accuracies.
-- Visualizations saved under ./outputs/ (and shown in Streamlit UI when available).
+  to a CLI flow that prompts for a CSV path.
 
 Usage:
 - Streamlit UI: streamlit run app.py
@@ -72,7 +70,48 @@ except Exception:
 
 
 # ----------------------------
-# Helper plotting functions
+# Robust CSV preview helper
+# ----------------------------
+def read_csv_preview(path: str, nrows: int = 10) -> Tuple[pd.DataFrame, str]:
+    """
+    Read a CSV file for preview robustly, returning (DataFrame, encoding_used).
+    Strategy:
+      1) Try pandas.read_csv with no encoding (uses default, typically 'utf-8')
+      2) If UnicodeDecodeError, attempt common encodings: 'utf-8', 'latin1', 'cp1252'
+      3) If still failing, open file in text mode with errors='replace' and feed to pandas via StringIO.
+         In that final case encoding_used = 'replaced-invalid-bytes'
+    """
+    encodings_to_try = [None, "utf-8", "latin1", "cp1252"]
+    last_exception = None
+
+    for enc in encodings_to_try:
+        try:
+            if enc is None:
+                df = pd.read_csv(path, nrows=nrows)
+            else:
+                df = pd.read_csv(path, encoding=enc, nrows=nrows)
+            return df, enc or "default"
+        except UnicodeDecodeError as e:
+            last_exception = e
+            continue
+        except Exception as e:
+            # Some files may raise other parse errors; for preview we still try the next strategy
+            last_exception = e
+            continue
+
+    # Final fallback: open bytes and decode with errors='replace' to avoid decode failure
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        df = pd.read_csv(io.StringIO(text), nrows=nrows)
+        return df, "replaced-invalid-bytes"
+    except Exception as e:
+        # As ultimate fallback, return an empty DataFrame and raise the last exception for visibility
+        raise RuntimeError(f"Failed to read CSV for preview. Last error: {last_exception}; final error: {e}")
+
+
+# ----------------------------
+# Helper plotting functions (unchanged)
 # ----------------------------
 def save_and_show(fig, filename: str, dpi: int = 150, tight: bool = True):
     """Save figure to outputs directory and close it."""
@@ -483,7 +522,7 @@ def cross_validate_models(trained_models: Dict[str, object], X: pd.DataFrame, y:
 
 
 # ----------------------------
-# UI: Streamlit
+# UI: Streamlit (with robust preview)
 # ----------------------------
 def run_streamlit_app():
     st.set_page_config(page_title="Microplastic Risk Modeling", layout="wide")
@@ -501,10 +540,11 @@ def run_streamlit_app():
         f.write(uploaded_file.getbuffer())
     st.success(f"File saved to: {save_path}")
 
-    # Preview
+    # Robust preview
     try:
-        df_preview = pd.read_csv(save_path, nrows=10)
+        df_preview, encoding_used = read_csv_preview(save_path, nrows=10)
         st.subheader("Preview (first 10 rows)")
+        st.write(f"Preview read using encoding: {encoding_used}")
         st.dataframe(df_preview)
     except Exception as e:
         st.error(f"Could not preview uploaded CSV: {e}")
