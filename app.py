@@ -1,23 +1,25 @@
 """
 app.py
 
-Predictive Risk Modeling Framework for Microplastic Pollution (Streamlit UI, auto-run)
+Predictive Risk Modeling Framework for Microplastic Pollution (Streamlit-enabled)
 
-Changes in this version:
-- When a user uploads a CSV in the Streamlit UI the full pipeline runs automatically (no "Run" button).
-- A clear sidebar navigation is provided so users can switch between:
-    * Upload & Preview
-    * Visualizations
-    * Model Results
-    * Download Outputs
-- Robust CSV preview reading (multiple encodings + fallback) to avoid decode errors.
-- All outputs (plots, summaries) continue to be saved to the ./outputs/ folder.
+This version fixes CSV preview decoding errors by using robust CSV-reading fallback:
+- Tries pandas default read
+- If UnicodeDecodeError occurs, tries common encodings (utf-8, latin1, cp1252)
+- If still failing, opens file with errors='replace' into a StringIO and reads via pandas
+- Displays the encoding (or 'replaced-invalid-bytes') used for preview in the Streamlit UI
+
+Behavior:
+- If Streamlit is available (and you run `streamlit run app.py`) a browser UI will appear.
+  * User uploads a CSV file via the UI.
+  * The uploaded file is saved to ./inputs/ and then the pipeline runs end-to-end.
+  * All plots and summaries are stored in ./outputs/ and displayed in the Streamlit UI.
+- If Streamlit is not available or you run the script directly (python app.py), the script falls back
+  to a CLI flow that prompts for a CSV path.
 
 Usage:
-    streamlit run app.py
-
-Requirements:
-    pandas, numpy, scikit-learn, matplotlib, seaborn, streamlit
+- Streamlit UI: streamlit run app.py
+- CLI: python app.py --csv path/to/MicroPlastic.csv
 """
 
 import os
@@ -28,7 +30,6 @@ from typing import Dict, Tuple, List, Optional
 import io
 import glob
 import zipfile
-import time
 
 import numpy as np
 import pandas as pd
@@ -59,20 +60,27 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(INPUT_DIR, exist_ok=True)
 sns.set(style="whitegrid")
 
-# Try Streamlit import
+# Try optional Streamlit import
 try:
     import streamlit as st  # type: ignore
 
     STREAMLIT_AVAILABLE = True
 except Exception:
     STREAMLIT_AVAILABLE = False
-    # If Streamlit is not available, we fallback to CLI behavior below.
 
 
 # ----------------------------
 # Robust CSV preview helper
 # ----------------------------
 def read_csv_preview(path: str, nrows: int = 10) -> Tuple[pd.DataFrame, str]:
+    """
+    Read a CSV file for preview robustly, returning (DataFrame, encoding_used).
+    Strategy:
+      1) Try pandas.read_csv with no encoding (uses default, typically 'utf-8')
+      2) If UnicodeDecodeError, attempt common encodings: 'utf-8', 'latin1', 'cp1252'
+      3) If still failing, open file in text mode with errors='replace' and feed to pandas via StringIO.
+         In that final case encoding_used = 'replaced-invalid-bytes'
+    """
     encodings_to_try = [None, "utf-8", "latin1", "cp1252"]
     last_exception = None
 
@@ -87,28 +95,32 @@ def read_csv_preview(path: str, nrows: int = 10) -> Tuple[pd.DataFrame, str]:
             last_exception = e
             continue
         except Exception as e:
+            # Some files may raise other parse errors; for preview we still try the next strategy
             last_exception = e
             continue
 
-    # Final fallback: open with errors='replace'
+    # Final fallback: open bytes and decode with errors='replace' to avoid decode failure
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             text = f.read()
         df = pd.read_csv(io.StringIO(text), nrows=nrows)
         return df, "replaced-invalid-bytes"
     except Exception as e:
+        # As ultimate fallback, return an empty DataFrame and raise the last exception for visibility
         raise RuntimeError(f"Failed to read CSV for preview. Last error: {last_exception}; final error: {e}")
 
 
 # ----------------------------
-# Plot helpers (save to outputs and return path)
+# Helper plotting functions (unchanged)
 # ----------------------------
 def save_and_show(fig, filename: str, dpi: int = 150, tight: bool = True):
+    """Save figure to outputs directory and close it."""
     path = os.path.join(OUTPUT_DIR, filename)
     if tight:
         fig.tight_layout()
     fig.savefig(path, dpi=dpi)
     plt.close(fig)
+    # Return saved path
     return path
 
 
@@ -247,23 +259,31 @@ def plot_cv_boxplot(cv_scores: Dict[str, np.ndarray], prefix: str = "cv"):
 
 
 # ----------------------------
-# Core processing (same pipeline)
+# Core processing functions
 # ----------------------------
 def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, Dict]:
+    """
+    Load dataset and perform preprocessing (visualizations saved along the way).
+    Returns X_train, X_test, y_train, y_test, meta dictionary.
+    """
+    print("\n[1] Loading dataset...")
     try:
         df = pd.read_csv(csv_path)
     except Exception as e:
         raise RuntimeError(f"Failed to read CSV from '{csv_path}': {e}")
 
+    print(f" - Loaded dataset with shape: {df.shape}")
+
     visuals = {"plots": []}
 
     # Missing values heatmap
     try:
-        visuals["plots"].append(plot_missing_values_heatmap(df, fname="missing_heatmap.png"))
-    except Exception:
-        pass
+        path = plot_missing_values_heatmap(df, fname="missing_heatmap.png")
+        visuals["plots"].append(path)
+    except Exception as e:
+        print(f"Could not save missing values plot: {e}")
 
-    # Target selection
+    # Determine target
     if "Risk_Level" in df.columns:
         target_col = "Risk_Level"
     elif "Risk_Type" in df.columns:
@@ -271,7 +291,7 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
     else:
         target_col = df.columns[-1]
 
-    # Fill missing
+    # Handle missing values
     num_cols_all = df.select_dtypes(include=[np.number]).columns.tolist()
     cat_cols_all = df.select_dtypes(include=["object", "category"]).columns.tolist()
     for c in num_cols_all:
@@ -279,7 +299,7 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
     for c in cat_cols_all:
         df[c] = df[c].fillna("Missing")
 
-    # Outlier handling (IQR) for specified columns
+    # Outlier handling on specified columns
     outlier_cols = [
         "MP_Count_per_L",
         "Risk_Score",
@@ -297,11 +317,12 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
         df[col] = np.where(df[col] < lower, lower, df[col])
         df[col] = np.where(df[col] > upper, upper, df[col])
     try:
-        visuals["plots"].extend(plot_boxplot_before_after(df_before_outliers, df, outlier_cols_present, prefix="outlier"))
-    except Exception:
-        pass
+        saved = plot_boxplot_before_after(df_before_outliers, df, outlier_cols_present, prefix="outlier")
+        visuals["plots"].extend(saved)
+    except Exception as e:
+        print(f"Could not save outlier boxplots: {e}")
 
-    # Skewness detection & log1p transform
+    # Skewness analysis and log1p transform
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     if target_col in numeric_cols:
         numeric_cols.remove(target_col)
@@ -317,11 +338,12 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
         df[col] = np.log1p(df[col] + shift)
         transforms_applied[col] = {"shift": shift}
     try:
-        visuals["plots"].extend(plot_histogram_comparison(df_before_skew, df, skewed_cols, prefix="skew"))
-    except Exception:
-        pass
+        saved = plot_histogram_comparison(df_before_skew, df, skewed_cols, prefix="skew")
+        visuals["plots"].extend(saved)
+    except Exception as e:
+        print(f"Could not save skewness histograms: {e}")
 
-    # Categorical encoding (user-specified list)
+    # Categorical encoding
     cols_to_encode = [
         "Location",
         "Shape",
@@ -336,7 +358,8 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
     ]
     cols_to_encode_present = [c for c in cols_to_encode if c in df.columns]
     try:
-        visuals["plots"].extend(plot_categorical_counts(df, cols_to_encode_present, top_n=8, prefix="cat_before_encoding"))
+        saved = plot_categorical_counts(df, cols_to_encode_present, top_n=8, prefix="cat_before_encoding")
+        visuals["plots"].extend(saved)
     except Exception:
         pass
 
@@ -381,7 +404,8 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
         X_numeric_scaled = pd.DataFrame(index=X_df.index)
 
     try:
-        visuals["plots"].extend(plot_scaled_feature_distributions(X_numeric_scaled, prefix="scaled"))
+        saved = plot_scaled_feature_distributions(X_numeric_scaled, prefix="scaled")
+        visuals["plots"].extend(saved)
     except Exception:
         pass
 
@@ -401,12 +425,6 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
             X_final, y, test_size=0.2, random_state=RANDOM_STATE, stratify=None
         )
 
-    # Save a small snapshot of preprocessed data
-    try:
-        df.head(20).to_csv(os.path.join(OUTPUT_DIR, "dataset_head_after_preprocessing.csv"), index=False)
-    except Exception:
-        pass
-
     meta = {
         "scaler": scaler,
         "label_encoders": label_encoders,
@@ -418,10 +436,17 @@ def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame,
         "csv_path": csv_path,
     }
 
+    # Save a small snapshot of data (heads) for reference
+    try:
+        df.head(20).to_csv(os.path.join(OUTPUT_DIR, "dataset_head_after_preprocessing.csv"), index=False)
+    except Exception:
+        pass
+
     return X_train, X_test, y_train, y_test, meta
 
 
 def train_models(X_train: pd.DataFrame, y_train: pd.Series) -> Dict[str, object]:
+    print("\n[TRAIN] Training models...")
     models = {
         "LogisticRegression": LogisticRegression(max_iter=1000, random_state=RANDOM_STATE),
         "RandomForest": RandomForestClassifier(n_estimators=100, random_state=RANDOM_STATE),
@@ -440,6 +465,7 @@ def train_models(X_train: pd.DataFrame, y_train: pd.Series) -> Dict[str, object]
 
 
 def validate_models(trained_models: Dict[str, object], X_test: pd.DataFrame, y_test: pd.Series, meta: Dict) -> Dict[str, Dict[str, float]]:
+    print("\n[VALIDATE] Validating models...")
     results = {}
     le_target = meta.get("label_encoders", {}).get(meta.get("target_col", "") + "_target", None)
     class_names = list(le_target.classes_) if le_target is not None else None
@@ -451,16 +477,18 @@ def validate_models(trained_models: Dict[str, object], X_test: pd.DataFrame, y_t
         rec = recall_score(y_test, y_pred, average="weighted", zero_division=0)
         f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
         results[name] = {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1}
+        # Save confusion matrix
         try:
             plot_confusion_matrix_heatmap(y_test, y_pred, classes=class_names, name=name)
         except Exception:
             pass
-
+    # Save metrics comparison plot
     try:
         plot_metrics_comparison(results, prefix="metrics")
     except Exception:
         pass
 
+    # Save summary to CSV
     try:
         pd.DataFrame(results).T.to_csv(os.path.join(OUTPUT_DIR, "test_results_summary.csv"))
     except Exception:
@@ -470,6 +498,7 @@ def validate_models(trained_models: Dict[str, object], X_test: pd.DataFrame, y_t
 
 
 def cross_validate_models(trained_models: Dict[str, object], X: pd.DataFrame, y: pd.Series, k: int = 5) -> Dict[str, np.ndarray]:
+    print("\n[CV] Cross-validating models...")
     cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=RANDOM_STATE)
     cv_scores = {}
     for name, model in trained_models.items():
@@ -478,155 +507,108 @@ def cross_validate_models(trained_models: Dict[str, object], X: pd.DataFrame, y:
             cv_scores[name] = scores
         except Exception:
             cv_scores[name] = np.array([])
-
+    # Save CV boxplot
     try:
         plot_cv_boxplot(cv_scores, prefix="cv")
     except Exception:
         pass
-
+    # Save CV summary
     try:
         cv_summary = {k: (np.mean(v) if v.size else np.nan) for k, v in cv_scores.items()}
         pd.Series(cv_summary).to_csv(os.path.join(OUTPUT_DIR, "cv_mean_accuracy_summary.csv"))
     except Exception:
         pass
-
     return cv_scores
 
 
 # ----------------------------
-# Streamlit UI (auto-run + sidebar navigation)
+# UI: Streamlit (with robust preview)
 # ----------------------------
 def run_streamlit_app():
     st.set_page_config(page_title="Microplastic Risk Modeling", layout="wide")
-    st.sidebar.title("Navigation")
-    nav_choice = st.sidebar.radio(
-        "Go to",
-        ("Upload & Preview", "Visualizations", "Model Results", "Download Outputs"),
-    )
-
     st.title("Predictive Risk Modeling for Microplastic Pollution")
-    st.write(
-        "Upload a CSV file containing microplastic monitoring data. The pipeline will run automatically after upload. "
-        "Outputs (plots & CSVs) are stored in the 'outputs' folder."
-    )
+    st.write("Upload a CSV file containing microplastic monitoring data. The pipeline will run end-to-end and save outputs to the 'outputs' folder.")
 
-    uploaded_file = st.file_uploader("Upload CSV file", type=["csv"], help="CSV file with microplastic monitoring data")
-    # Track last processed file to avoid re-processing identical file repeatedly
-    if "last_processed" not in st.session_state:
-        st.session_state["last_processed"] = {"filename": None, "ts": None}
+    uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
+    if uploaded_file is None:
+        st.info("Please upload a CSV file to proceed.")
+        return
 
-    preview_df = None
-    encoding_used = None
+    # Save uploaded file
+    save_path = os.path.join(INPUT_DIR, uploaded_file.name)
+    with open(save_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    st.success(f"File saved to: {save_path}")
 
-    if uploaded_file is not None:
-        save_path = os.path.join(INPUT_DIR, uploaded_file.name)
-        # Save uploaded file
-        with open(save_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        st.success(f"File saved to: {save_path}")
+    # Robust preview
+    try:
+        df_preview, encoding_used = read_csv_preview(save_path, nrows=10)
+        st.subheader("Preview (first 10 rows)")
+        st.write(f"Preview read using encoding: {encoding_used}")
+        st.dataframe(df_preview)
+    except Exception as e:
+        st.error(f"Could not preview uploaded CSV: {e}")
 
-        # Robust preview
-        try:
-            preview_df, encoding_used = read_csv_preview(save_path, nrows=10)
-        except Exception as e:
-            st.error(f"Could not preview uploaded CSV: {e}")
-            preview_df = None
+    if st.button("Run full pipeline"):
+        with st.spinner("Running preprocessing, training, validation, and cross-validation..."):
+            try:
+                X_train, X_test, y_train, y_test, meta = load_and_preprocess_data(save_path)
+                trained_models = train_models(X_train, y_train)
+                test_results = validate_models(trained_models, X_test, y_test, meta)
+                X_full = pd.concat([X_train, X_test], axis=0)
+                y_full = pd.concat([y_train, y_test], axis=0)
+                cv_scores = cross_validate_models(trained_models, X_full, y_full, k=5)
+            except Exception as e:
+                st.error(f"Pipeline failed: {e}")
+                return
 
-        # Determine whether to run pipeline: run if new file or not processed recently
-        new_file = st.session_state["last_processed"]["filename"] != uploaded_file.name
-        if new_file:
-            st.session_state["last_processed"] = {"filename": uploaded_file.name, "ts": time.time()}
-            # Automatically run pipeline
-            with st.spinner("Running full pipeline automatically..."):
+        st.success("Pipeline completed. Outputs saved to the 'outputs' folder.")
+
+        # Show saved plots
+        st.subheader("Saved visualizations")
+        image_paths = sorted(glob.glob(os.path.join(OUTPUT_DIR, "*.png")))
+        if image_paths:
+            cols = st.columns(2)
+            for i, img_path in enumerate(image_paths):
                 try:
-                    X_train, X_test, y_train, y_test, meta = load_and_preprocess_data(save_path)
-                    trained_models = train_models(X_train, y_train)
-                    test_results = validate_models(trained_models, X_test, y_test, meta)
-                    X_full = pd.concat([X_train, X_test], axis=0)
-                    y_full = pd.concat([y_train, y_test], axis=0)
-                    cv_scores = cross_validate_models(trained_models, X_full, y_full, k=5)
-                    # store results in session_state for interactive viewing
-                    st.session_state["pipeline_result"] = {
-                        "save_path": save_path,
-                        "meta": meta,
-                        "test_results": test_results,
-                        "cv_scores": {k: v.tolist() for k, v in cv_scores.items()},
-                    }
-                    st.success("Pipeline completed successfully.")
-                except Exception as e:
-                    st.error(f"Pipeline failed: {e}")
-                    st.session_state.pop("pipeline_result", None)
-
-    # Sidebar navigation: content rendering
-    if nav_choice == "Upload & Preview":
-        st.header("Upload & Preview")
-        st.info("Upload a CSV above to automatically run the pipeline. Preview shows first 10 rows (robustly read).")
-        if preview_df is not None:
-            st.write(f"Preview read using encoding: {encoding_used}")
-            st.dataframe(preview_df)
+                    with open(img_path, "rb") as f:
+                        img_bytes = f.read()
+                    col = cols[i % 2]
+                    col.image(img_bytes, caption=os.path.basename(img_path))
+                except Exception:
+                    st.write(f"Could not load image {img_path}")
         else:
-            st.write("No preview available yet. Upload a CSV to see a preview.")
-    elif nav_choice == "Visualizations":
-        st.header("Visualizations (saved in outputs/)")
-        if "pipeline_result" not in st.session_state:
-            st.info("No pipeline run available. Upload a CSV to run the pipeline and generate visualizations.")
-        else:
-            # show saved images (sorted)
-            image_paths = sorted(glob.glob(os.path.join(OUTPUT_DIR, "*.png")))
-            if image_paths:
-                for img_path in image_paths:
-                    try:
-                        st.image(img_path, caption=os.path.basename(img_path))
-                    except Exception:
-                        st.write(f"Could not load image {img_path}")
-            else:
-                st.info("No visualizations found in outputs/ yet.")
-    elif nav_choice == "Model Results":
-        st.header("Model Results & Metrics")
-        if "pipeline_result" not in st.session_state:
-            st.info("No pipeline run available. Upload a CSV to run the pipeline.")
-        else:
-            result = st.session_state["pipeline_result"]
-            # Display test results table if exists
-            test_results = result.get("test_results", {})
-            if test_results:
-                df_results = pd.DataFrame(test_results).T
-                st.subheader("Test set performance (accuracy, precision, recall, f1)")
-                st.dataframe(df_results)
-            else:
-                st.write("No test results saved.")
+            st.info("No images found in outputs folder.")
 
-            # Display CV scores summary
-            cv_scores = result.get("cv_scores", {})
-            if cv_scores:
-                st.subheader("Cross-validation accuracy per fold")
-                for model_name, scores in cv_scores.items():
-                    st.write(f"{model_name}: {scores}")
-            else:
-                st.write("No cross-validation results.")
+        # Show test results table if available
+        result_csv = os.path.join(OUTPUT_DIR, "test_results_summary.csv")
+        if os.path.exists(result_csv):
+            st.subheader("Test results summary")
+            try:
+                rr = pd.read_csv(result_csv, index_col=0)
+                st.dataframe(rr)
+                st.download_button("Download test results CSV", data=open(result_csv, "rb").read(), file_name="test_results_summary.csv")
+            except Exception:
+                st.write("Could not load test results CSV.")
+        else:
+            st.info("Test results CSV not found.")
 
-            # Show list of saved CSV summaries
-            summary_csv = os.path.join(OUTPUT_DIR, "test_results_summary.csv")
-            if os.path.exists(summary_csv):
-                with open(summary_csv, "rb") as f:
-                    st.download_button("Download test results CSV", data=f, file_name="test_results_summary.csv")
-    elif nav_choice == "Download Outputs":
-        st.header("Download Outputs")
-        st.write(f"All pipeline outputs are saved to: {os.path.abspath(OUTPUT_DIR)}")
-        # Create zip and offer download
+        # Provide a ZIP of outputs for download
         zip_path = os.path.join(OUTPUT_DIR, "outputs_bundle.zip")
         try:
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for file in glob.glob(os.path.join(OUTPUT_DIR, "*")):
                     zf.write(file, arcname=os.path.basename(file))
             with open(zip_path, "rb") as f:
-                st.download_button("Download all outputs (zip)", data=f, file_name="outputs_bundle.zip")
+                btn = st.download_button("Download all outputs (zip)", data=f, file_name="outputs_bundle.zip")
         except Exception as e:
             st.write(f"Could not create/download outputs zip: {e}")
 
+        st.info(f"Outputs folder: {os.path.abspath(OUTPUT_DIR)}")
+
 
 # ----------------------------
-# CLI fallback (unchanged minimal)
+# CLI helpers (fallback)
 # ----------------------------
 def parse_cli_csv_arg() -> Optional[str]:
     args = sys.argv[1:]
@@ -645,6 +627,7 @@ def parse_cli_csv_arg() -> Optional[str]:
 def get_csv_path_interactive() -> str:
     cli = parse_cli_csv_arg()
     if cli:
+        print(f"Using CSV from CLI: {cli}")
         return cli
     csv_path = input("Enter path or URL to CSV file: ").strip()
     if not csv_path:
@@ -653,15 +636,21 @@ def get_csv_path_interactive() -> str:
     return csv_path
 
 
+# ----------------------------
+# Entrypoint
+# ----------------------------
 def main_cli():
     csv_path = get_csv_path_interactive()
+    # If path points to an uploaded file under inputs, leave it; else if it's a URL or remote, pandas will read it.
     if os.path.isfile(csv_path):
         saved_path = csv_path
     else:
+        # try to download / save URL with pandas
         try:
             df_tmp = pd.read_csv(csv_path)
             saved_path = os.path.join(INPUT_DIR, os.path.basename(csv_path) or "uploaded.csv")
             df_tmp.to_csv(saved_path, index=False)
+            print(f"Downloaded CSV saved to {saved_path}")
         except Exception:
             print(f"Could not read CSV from {csv_path}. Exiting.")
             sys.exit(1)
@@ -676,12 +665,9 @@ def main_cli():
     print("\nPipeline finished. Outputs saved in:", os.path.abspath(OUTPUT_DIR))
 
 
-# ----------------------------
-# Entrypoint
-# ----------------------------
 if __name__ == "__main__":
     if STREAMLIT_AVAILABLE:
+        # When Streamlit runs this script, it will execute top-level code. Use the Streamlit UI instead.
         run_streamlit_app()
     else:
-        print("Streamlit not available. Running CLI fallback.")
         main_cli()
